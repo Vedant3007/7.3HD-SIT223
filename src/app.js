@@ -1,19 +1,19 @@
-const express = require('express');
-const morgan = require('morgan');
+const express = require('express')
+const morgan = require('morgan')
 
-const app = express();
-app.use(express.json());
-app.use(morgan('dev'));
+const app = express()
+app.use(express.json())
+app.use(morgan('dev'))
 
-const items = [{ id: 1, name: 'Sample item' }];
+const items = [{ id: 1, name: 'Sample item' }]
 
 app.get('/', (_req, res) => {
-  res.json({ message: 'Welcome to simple-devops-app' });
-});
+  res.json({ message: 'Welcome to simple-devops-app' })
+})
 
 app.get('/api/items', (_req, res) => {
-  res.json(items);
-});
+  res.json(items)
+})
 
 app.get('/health', (_req, res) => {
   res.json({
@@ -21,7 +21,7 @@ app.get('/health', (_req, res) => {
     service: 'simple-devops-app',
     version: '1.0.0',
     timestamp: new Date().toISOString()
-  });
-});
+  })
+})
 
-module.exports = app;
+module.exports = app
