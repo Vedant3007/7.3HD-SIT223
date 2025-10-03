@@ -1,0 +1,212 @@
+def stageResults = [:]
+
+pipeline {
+    agent any
+    options { timestamps() }
+
+    environment {
+        REPO_URL      = 'https://github.com/Vedant3007/7.3HD-SIT223'
+        APP_NAME      = "simple-devops-app"
+        STAGING_DIR   = "C:\\apps\\simple-devops-app-staging"
+        PROD_DIR      = "C:\\apps\\simple-devops-app-prod"
+        STAGING_PORT  = "3000"
+        PROD_PORT     = "4000"
+        ARTIFACT_DIR  = "artifacts"
+        ARTIFACT_NAME = "simple-devops-app-${BUILD_NUMBER}.zip"
+        ALERT_EMAIL   = "vedantpatel1st@gmail.com"
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script { stageResults['Checkout'] = 'SUCCESS' }
+                deleteDir()
+                bat 'git --version'
+                bat "git ls-remote --heads ${env.REPO_URL}"
+                checkout([$class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [[$class: 'CleanBeforeCheckout']],
+                    userRemoteConfigs: [[ url: env.REPO_URL ]]
+                ])
+                bat 'git rev-parse --abbrev-ref HEAD'
+                bat 'git log -1 --oneline'
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script { stageResults['Build'] = 'SUCCESS' }
+                echo "Installing deps..."
+                bat 'npm install --legacy-peer-deps'
+                echo "Zipping artifact..."
+                powershell '''
+                    New-Item -ItemType Directory -Force -Path "$env:ARTIFACT_DIR" | Out-Null
+                    $files = @("package.json","package-lock.json","src",".eslintrc.json",".eslintignore")
+                    if (Test-Path node_modules) { Remove-Item -Recurse -Force node_modules }
+                    if (Test-Path coverage)     { Remove-Item -Recurse -Force coverage }
+                    $zipPath = Join-Path $env:ARTIFACT_DIR $env:ARTIFACT_NAME
+                    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+                    Compress-Archive -Path $files -DestinationPath $zipPath
+                    Write-Host "Artifact: $zipPath"
+                '''
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script { stageResults['Test'] = 'SUCCESS' }
+                bat 'npm install --legacy-peer-deps'
+                bat 'npx jest --runInBand --detectOpenHandles --colors'
+            }
+            post {
+                unsuccessful { script { stageResults['Test'] = 'FAILED' } }
+            }
+        }
+
+        stage('Code Quality') {
+            steps {
+                script { stageResults['Code Quality'] = 'SUCCESS' }
+                bat 'npm run lint'
+            }
+            post {
+                unsuccessful { script { stageResults['Code Quality'] = 'FAILED' } }
+            }
+        }
+
+        stage('Security') {
+            steps {
+                script { stageResults['Security'] = 'SUCCESS' }
+                bat 'npm audit --audit-level=high'
+            }
+            post {
+                unsuccessful { script { stageResults['Security'] = 'FAILED' } }
+            }
+        }
+
+        stage('Archive Artifact') {
+            steps {
+                script { stageResults['Archive Artifact'] = 'SUCCESS' }
+                archiveArtifacts artifacts: "${ARTIFACT_DIR}/${ARTIFACT_NAME}", fingerprint: true
+            }
+        }
+
+        stage('Deploy (Staging)') {
+            steps {
+                script { stageResults['Deploy (Staging)'] = 'SUCCESS' }
+                powershell '''
+                    if (Test-Path "${env:STAGING_DIR}") { Remove-Item -Recurse -Force "${env:STAGING_DIR}" }
+                    New-Item -ItemType Directory -Force -Path "${env:STAGING_DIR}" | Out-Null
+                    Copy-Item -Recurse "${env:WORKSPACE}\\*" "${env:STAGING_DIR}"
+                    Push-Location "${env:STAGING_DIR}"
+                    npm install --omit=dev --legacy-peer-deps
+                    Start-Process -FilePath "node" -ArgumentList "src/server.js" -WindowStyle Hidden
+                    Start-Sleep -Seconds 5
+                    try {
+                        $response = Invoke-WebRequest -UseBasicParsing "http://localhost:${env:STAGING_PORT}/health"
+                        if ($response.StatusCode -eq 200) { Write-Host "Staging deployment successful!" }
+                        else { throw "Health check failed!" }
+                    } catch {
+                        Write-Host "Health check failed!"
+                        exit 1
+                    }
+                    Pop-Location
+                '''
+            }
+            post {
+                unsuccessful { script { stageResults['Deploy (Staging)'] = 'FAILED' } }
+            }
+        }
+
+        stage('Release (Production)') {
+            steps {
+                script { stageResults['Release (Production)'] = 'SUCCESS' }
+                powershell '''
+                    if (Test-Path "${env:PROD_DIR}") {
+                        Write-Host "Removing old production folder..."
+                        Remove-Item -Recurse -Force "${env:PROD_DIR}" -ErrorAction SilentlyContinue
+                    }
+                    New-Item -ItemType Directory -Force -Path "${env:PROD_DIR}" | Out-Null
+                    Copy-Item -Recurse "${env:WORKSPACE}\\*" "${env:PROD_DIR}" -Force
+                    Push-Location "${env:PROD_DIR}"
+                    npm install --omit=dev --legacy-peer-deps
+                    if ($LASTEXITCODE -ne 0) { Write-Host "npm install returned $LASTEXITCODE (continuing)." }
+
+                    # Kill any process on PROD_PORT
+                    try {
+                        $pids = (netstat -ano | findstr ":${env:PROD_PORT}" | ForEach-Object { ($_ -split '\\s+')[-1] }) | Sort-Object -Unique
+                        foreach ($pid in $pids) {
+                            if ($pid -and ($pid -match '\\d+')) {
+                                try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue; Write-Host "Stopped process $pid on port ${env:PROD_PORT}" } catch {}
+                            }
+                        }
+                    } catch {}
+
+                    # Start node in detached process
+                    $cmdArg = "set PORT=${env:PROD_PORT} && node src/server.js > node-prod.log 2>&1"
+                    Write-Host "Starting prod app: cmd /c $cmdArg"
+                    Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdArg -WorkingDirectory "${env:PROD_DIR}" -WindowStyle Hidden
+
+                    # Retry health check
+                    $maxRetries = 6
+                    $delaySec = 3
+                    $ok = $false
+                    for ($i=1; $i -le $maxRetries; $i++) {
+                        Start-Sleep -Seconds $delaySec
+                        try {
+                            $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:${env:PROD_PORT}/health" -TimeoutSec 5
+                            if ($resp.StatusCode -eq 200) { $ok = $true; Write-Host "Health check OK (attempt $i)"; break }
+                        } catch {
+                            Write-Host "Health check attempt $i failed: $($_.Exception.Message)"
+                        }
+                    }
+
+                    if (-not $ok) {
+                        Write-Host "Production health check failed after $maxRetries attempts."
+                        if (Test-Path "${env:PROD_DIR}\\node-prod.log") {
+                            Get-Content -Path "${env:PROD_DIR}\\node-prod.log" -Tail 200 | ForEach-Object { Write-Host $_ }
+                        }
+                        Pop-Location
+                        exit 1
+                    } else {
+                        Write-Host "Production deployment and health check successful!"
+                        Pop-Location
+                        exit 0
+                    }
+                '''
+            }
+            post {
+                unsuccessful { script { stageResults['Release (Production)'] = 'FAILED' } }
+            }
+        }
+
+        stage('Monitoring & Alerting') {
+            steps {
+                script { stageResults['Monitoring & Alerting'] = 'SUCCESS' }
+                powershell 'Invoke-WebRequest -UseBasicParsing "http://localhost:${env:STAGING_PORT}/health" | Out-Null'
+                powershell 'Invoke-WebRequest -UseBasicParsing "http://localhost:${env:PROD_PORT}/health"   | Out-Null'
+            }
+            post {
+                unsuccessful { script { stageResults['Monitoring & Alerting'] = 'FAILED' } }
+            }
+        }
+
+    } // end stages
+
+    post {
+        always {
+            script {
+                // Compose email
+                def message = "Pipeline Overview for ${env.JOB_NAME} #${env.BUILD_NUMBER}\n\n"
+                stageResults.each { k,v -> message += "${k}: ${v}\n" }
+
+                mail to: "${ALERT_EMAIL}",
+                     subject: "Pipeline Result: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                     body: message
+            }
+        }
+        success { echo "Pipeline completed successfully ✅" }
+        failure { echo "Pipeline failed ❌" }
+    }
+}
